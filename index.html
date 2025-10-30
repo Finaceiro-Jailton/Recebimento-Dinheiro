@@ -254,7 +254,7 @@
             </tfoot>
           </table>
         </div>
-        <div class="muted" style="margin-top:8px">Mais recentes no topo. (Volátil: sem localStorage. Firebase entrará depois.)</div>
+        <div class="muted" style="margin-top:8px">Mais recentes no topo.</div>
       </div>
     </section>
   </div>
@@ -276,6 +276,33 @@
     </div>
   </div>
 
+  <!-- Firebase SDKs (CDN 12.4.0) - Primeiro para ficar disponível ao app -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
+    import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-analytics.js";
+    import { getAuth } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-auth.js";
+    import { getFirestore } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDuGe6qPKs2mMjf1IQNkEGzu0ybwGU0rxg",
+      authDomain: "recebimento-em-lote.firebaseapp.com",
+      projectId: "recebimento-em-lote",
+      storageBucket: "recebimento-em-lote.firebasestorage.app",
+      messagingSenderId: "1060968440971",
+      appId: "1:1060968440971:web:dbb5c264f8a85f86e6608e",
+      measurementId: "G-KZBGQVMG50"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    try { getAnalytics(app); } catch(e) {}
+    const auth = getAuth(app);
+    const db   = getFirestore(app);
+
+    // expõe para o script principal
+    window.firebase = { app, auth, db };
+  </script>
+
+  <!-- App -->
   <script type="module">
     const $ = (s)=>document.querySelector(s);
     const $$ = (s)=>document.querySelectorAll(s);
@@ -283,6 +310,14 @@
     const fmt = (n)=> BRL.format(Number.isFinite(+n)?+n:0);
     const tol = 0.005;
     const DEL_PASS = '63258116';
+
+    // Firestore imports (usa a instância exposta acima)
+    import {
+      getFirestore, collection, addDoc, getDocs, deleteDoc, doc,
+      query, where, serverTimestamp
+    } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
+
+    const db = window.firebase?.db || getFirestore();
 
     function maskBRLInput(el, allowNegative=false){
       const raw = el.value ?? '';
@@ -319,14 +354,13 @@
         const tab = btn.dataset.tab;
         $('#tab-fechamento').classList.toggle('hidden', tab!=='fechamento');
         $('#tab-historico').classList.toggle('hidden', tab!=='historico');
-        if(tab==='historico') renderHistorico();
+        if(tab==='historico') renderHistorico(); // carrega Firestore
       });
     });
 
     // State
     let rows = [];                // linhas do formulário atual
-    let lots = [];                // histórico em memória
-    let editModeId = null;        // somente para NOVA linha (sem editar existentes)
+    let editModeId = null;        // edição apenas na linha nova
 
     const dtInicio = $('#dtInicio'), dtFim = $('#dtFim'), dtDeposito = $('#dtDeposito');
     const valorDeposito = $('#valorDeposito'), pillConc = $('#pillConc');
@@ -455,7 +489,7 @@
       [dtInicio,dtFim,dtDeposito,motivo,responsavel].forEach(el=> el && el.addEventListener(evt, updateKPIs));
     });
 
-    // Adicionar linha (somente criação; sem editar existentes)
+    // Adicionar linha (criação)
     document.getElementById('btnAdd').addEventListener('click', ()=>{
       const id = crypto.randomUUID();
       rows.push({id, cliente:'', pedido:'', valor:0});
@@ -467,7 +501,7 @@
       },0);
     });
 
-    // Limpar todas as linhas (mantido como no original)
+    // Limpar todas as linhas
     document.getElementById('btnClear').addEventListener('click', ()=>{
       if(confirm('Remover todas as linhas?')){ rows=[]; editModeId=null; renderRows(); userEditedDeposit=false; }
     });
@@ -486,7 +520,7 @@
         const pwd = prompt('Informe a senha numérica para excluir:');
         if(pwd===DEL_PASS){
           rows.splice(idx,1); editModeId=null; renderRows();
-        } // senha errada → não faz nada
+        }
         return;
       }
 
@@ -567,101 +601,157 @@
       alert(erros.length ? '⚠️ Problemas encontrados:\n\n' + erros.join('\n') : '✅ Tudo certo.');
     });
 
-    // Fechar lote (salva no histórico e limpa formulário)
-    document.getElementById('btnFechar').addEventListener('click', ()=>{
+    // --------- Persistência Firestore ----------
+    async function salvarLoteFirestore(lot){
+      // competência derivada da data do depósito (YYYY-MM)
+      const competencia = (lot.dataDeposito || '').slice(0,7);
+      const payload = {
+        ...lot,
+        competencia,
+        createdAt: serverTimestamp(),
+      };
+      const ref = await addDoc(collection(db,'lotes'), payload);
+      return ref.id;
+    }
+
+    async function carregarHistorico(){
+      const m   = $('#fCompetencia').value; // YYYY-MM
+      const ini = $('#fInicio').value;      // YYYY-MM-DD
+      const fim = $('#fFim').value;         // YYYY-MM-DD
+
+      let constraints = [];
+      if(m)   constraints.push(where('competencia','==', m));
+      if(ini) constraints.push(where('dataDeposito','>=', ini));
+      if(fim) constraints.push(where('dataDeposito','<=', fim));
+
+      const snap = await getDocs(query(collection(db,'lotes'), ...constraints));
+      const rows = [];
+      snap.forEach(d=>{
+        const v = d.data();
+        rows.push({ id: d.id, ...v });
+      });
+
+      // ordena mais recentes por dataDeposito desc, depois createdAt (se existir)
+      rows.sort((a,b)=>{
+        const ad = (a.dataDeposito||''); const bd = (b.dataDeposito||'');
+        if(ad>bd) return -1; if(ad<bd) return 1;
+        const ac = a.createdAt?.seconds||0, bc = b.createdAt?.seconds||0;
+        return bc - ac;
+      });
+      return rows;
+    }
+
+    async function excluirLote(id){
+      await deleteDoc(doc(db,'lotes', id));
+    }
+    // ------------------------------------------
+
+    // Fechar lote (salva no Firestore e limpa formulário)
+    document.getElementById('btnFechar').addEventListener('click', async ()=>{
       const total = sumTotal();
       const dep = getBRL(valorDeposito);
       const adj = toggleAjuste.checked ? getBRL(ajuste) : 0;
       if(!(isValidHeader() && isValidRows() && conciliaOk(total, adj, dep, toggleAjuste.checked))) return;
 
       const lot = {
-        id: crypto.randomUUID(),
         inicio: dtInicio.value, fim: dtFim.value, dataDeposito: dtDeposito.value,
         valorDeposito: dep,
         diferenca: toggleAjuste.checked ? adj : 0,
         motivo: toggleAjuste.checked ? (motivo.value||'') : '',
         subtotal: total,
         pedidos: (Array.isArray(rows)?rows:[]).map(p=>({cliente:p.cliente, pedido: Number(p.pedido), valor: Number(p.valor)})),
-        responsavel: String(responsavel.value||'').trim(),
-        createdAt: Date.now(),
+        responsavel: String(responsavel.value||'').trim()
       };
-      lots.unshift(lot); // topo
-      renderHistorico();
 
-      // Reset formulário
-      dtInicio.value=''; dtFim.value=''; dtDeposito.value='';
-      valorDeposito.value=''; valorDeposito.dataset.value='0'; userEditedDeposit=false;
-      toggleAjuste.checked=false; ajusteBox.style.display='none'; if(ajuste){ajuste.value=''; ajuste.dataset.value='0';} if(motivo){motivo.value='';}
-      responsavel.value=''; respErr.classList.add('hidden');
-      rows=[]; editModeId=null;
-      renderRows(); updateKPIs();
+      try{
+        await salvarLoteFirestore(lot);
+        alert('✅ Lote salvo no Firestore.');
+        // Reset formulário
+        dtInicio.value=''; dtFim.value=''; dtDeposito.value='';
+        valorDeposito.value=''; valorDeposito.dataset.value='0'; userEditedDeposit=false;
+        toggleAjuste.checked=false; ajusteBox.style.display='none'; if(ajuste){ajuste.value=''; ajuste.dataset.value='0';} if(motivo){motivo.value='';}
+        responsavel.value=''; respErr.classList.add('hidden');
+        rows=[]; editModeId=null;
+        renderRows(); updateKPIs();
+        // Troca para a aba histórico e recarrega
+        document.querySelector('[data-tab="historico"]').click();
+      }catch(err){
+        console.error(err);
+        alert('Erro ao salvar no Firestore. Veja o console.');
+      }
     });
 
-    // Histórico
-    function renderHistorico(){
-      const tbodyH = $('#tbodyHist');
-      const list = applyHistoryFilter(lots);
-      tbodyH.innerHTML = '';
-      if(!Array.isArray(list) || list.length===0){
-        const tr = document.createElement('tr');
-        tr.innerHTML = '<td class="muted" colspan="8">Sem registros.</td>';
-        tbodyH.appendChild(tr);
-        setHistTotals(0,0,0,0);
-        return;
-      }
-      let tAdj=0, tDep=0, tSub=0, tQtd=0;
-      list.forEach(rec=>{
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${formatRange(rec.inicio, rec.fim)}</td>
-          <td>${formatDate(rec.dataDeposito)}</td>
-          <td>${fmt(rec.subtotal)}</td>
-          <td>${fmt(rec.diferenca)}</td>
-          <td>${fmt(rec.valorDeposito)}</td>
-          <td class="nowrap">${Array.isArray(rec.pedidos)?rec.pedidos.length:0}</td>
-          <td class="nowrap">${esc(rec.responsavel||'')}</td>
-          <td class="actions">
-            <button class="primary" data-hact="view" data-id="${rec.id}">Visualizar</button>
-            <button class="danger" data-hact="del" data-id="${rec.id}">Excluir</button>
-          </td>`;
-        tbodyH.appendChild(tr);
-        tAdj += Number(rec.diferenca)||0;
-        tDep += Number(rec.valorDeposito)||0;
-        tSub += Number(rec.subtotal)||0;
-        tQtd += Number(rec.pedidos?.length||0);
-      });
-      setHistTotals(tSub,tAdj,tDep,tQtd);
-    }
+    // Histórico (render)
     function setHistTotals(sub,adj,dep,qtd){
       $('#ftSubtotal').textContent = fmt(sub);
       $('#ftAjuste').textContent = fmt(adj);
       $('#ftDepositado').textContent = fmt(dep);
       $('#ftQtd').textContent = String(qtd);
     }
-
-    function applyHistoryFilter(list){
-      const m = $('#fCompetencia').value;
-      const ini = $('#fInicio').value;
-      const fim = $('#fFim').value;
-      if(!m && !ini && !fim) return Array.isArray(list)?list:[];
-      return (Array.isArray(list)?list:[]).filter(r=>{
-        const d = new Date(r.dataDeposito+'T00:00:00');
-        let ok = true;
-        if(m){
-          const [yy,mm] = m.split('-').map(Number);
-          ok = ok && d.getFullYear()===yy && (d.getMonth()+1)===mm;
-        }
-        if(ini){ ok = ok && d >= new Date(ini+'T00:00:00'); }
-        if(fim){ ok = ok && d <= new Date(fim+'T00:00:00'); }
-        return ok;
-      });
+    function formatDate(str){
+      if(!str) return '';
+      const d = new Date(str+'T00:00:00');
+      const dd = String(d.getDate()).padStart(2,'0');
+      const mm = String(d.getMonth()+1).padStart(2,'0');
+      const yyyy = d.getFullYear();
+      return `${dd}/${mm}/${yyyy}`;
     }
+    function formatRange(a,b){
+      if(!a && !b) return '';
+      const da = formatDate(a), db = formatDate(b);
+      if(da===db || !db) return da;
+      if(!da) return db;
+      return `${da} a ${db}`;
+    }
+
+    async function renderHistorico(){
+      const tbodyH = $('#tbodyHist');
+      tbodyH.innerHTML = '<tr><td colspan="8" class="muted">Carregando…</td></tr>';
+
+      try{
+        const list = await carregarHistorico();
+        tbodyH.innerHTML = '';
+        if(!Array.isArray(list) || list.length===0){
+          const tr = document.createElement('tr');
+          tr.innerHTML = '<td class="muted" colspan="8">Sem registros.</td>';
+          tbodyH.appendChild(tr);
+          setHistTotals(0,0,0,0);
+          return;
+        }
+        let tAdj=0, tDep=0, tSub=0, tQtd=0;
+        list.forEach(rec=>{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${formatRange(rec.inicio, rec.fim)}</td>
+            <td>${formatDate(rec.dataDeposito)}</td>
+            <td>${fmt(rec.subtotal)}</td>
+            <td>${fmt(rec.diferenca||0)}</td>
+            <td>${fmt(rec.valorDeposito||0)}</td>
+            <td class="nowrap">${Array.isArray(rec.pedidos)?rec.pedidos.length:0}</td>
+            <td class="nowrap">${esc(rec.responsavel||'')}</td>
+            <td class="actions">
+              <button class="primary" data-hact="view" data-id="${rec.id}">Visualizar</button>
+              <button class="danger" data-hact="del" data-id="${rec.id}">Excluir</button>
+            </td>`;
+          tbodyH.appendChild(tr);
+          tAdj += Number(rec.diferenca)||0;
+          tDep += Number(rec.valorDeposito)||0;
+          tSub += Number(rec.subtotal)||0;
+          tQtd += Number(rec.pedidos?.length||0);
+        });
+        setHistTotals(tSub,tAdj,tDep,tQtd);
+      }catch(err){
+        console.error(err);
+        tbodyH.innerHTML = '<tr><td colspan="8" class="muted">Erro ao carregar histórico.</td></tr>';
+      }
+    }
+
     document.getElementById('btnAplicarFiltro').addEventListener('click', renderHistorico);
     document.getElementById('btnLimparFiltro').addEventListener('click', ()=>{
       $('#fCompetencia').value=''; $('#fInicio').value=''; $('#fFim').value=''; renderHistorico();
     });
 
-    // ---- Modal helpers ----
+    // Modal helpers
     const modal = $('#modal');
     const modalBody = $('#modalBody');
     const btnCloseModal = $('#btnCloseModal');
@@ -683,16 +773,18 @@
     window.addEventListener('keydown', (e)=>{ if(e.key==='Escape' && modal.getAttribute('aria-hidden')==='false') closeModal(); });
     btnPrint.addEventListener('click', ()=>{ window.print(); });
 
-    // Histórico actions (sem editar; excluir com senha)
-    document.addEventListener('click',(e)=>{
+    // Histórico actions (visualizar / excluir com senha)
+    document.addEventListener('click', async (e)=>{
       const act = e.target.getAttribute('data-hact');
       if(!act) return;
       const id = e.target.getAttribute('data-id');
-      const idx = (Array.isArray(lots)?lots:[]).findIndex(x=>x.id===id);
-      if(idx<0) return;
 
       if(act==='view'){
-        const r = lots[idx];
+        // para evitar outra consulta, busca a linha na tabela e reconstrói com células (ou recarrega da fonte)
+        const list = await carregarHistorico();
+        const r = list.find(x=>x.id===id);
+        if(!r) return;
+
         const statusOk = (Math.abs((r.subtotal - (r.diferenca||0)) - (r.valorDeposito||0)) < tol);
         const statusTag = `<span class="tag" style="border-color:${statusOk?'var(--ok)':'var(--err)'};color:${statusOk?'var(--ok)':'var(--err)'}">${statusOk?'Conciliado':'Com diferença'}</span>`;
         const pedidosRows = (Array.isArray(r.pedidos)?r.pedidos:[]).map((p,i)=>`
@@ -758,63 +850,20 @@
       if(act==='del'){
         const pwd = prompt('Informe a senha numérica para excluir:');
         if(pwd===DEL_PASS){
-          lots.splice(idx,1); renderHistorico();
+          try{
+            await excluirLote(id);
+            await renderHistorico();
+          }catch(err){
+            console.error(err);
+            alert('Erro ao excluir no Firestore.');
+          }
         }
         return;
       }
     });
 
-    function formatDate(str){
-      if(!str) return '';
-      // Aceita YYYY-MM-DD e imprime DD/MM/AAAA
-      const d = new Date(str+'T00:00:00');
-      const dd = String(d.getDate()).padStart(2,'0');
-      const mm = String(d.getMonth()+1).padStart(2,'0');
-      const yyyy = d.getFullYear();
-      return `${dd}/${mm}/${yyyy}`;
-    }
-    function formatRange(a,b){
-      if(!a && !b) return '';
-      const da = formatDate(a), db = formatDate(b);
-      if(da===db || !db) return da;
-      if(!da) return db;
-      return `${da} a ${db}`;
-    }
-
+    // Inicialização
     renderRows(); updateKPIs();
-  </script>
-
-  <!-- Firebase SDKs (versão web standalone / sem bundler) -->
-  <script type="module">
-    // Import dos SDKs (versão web standalone / sem bundler)
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-    import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-analytics.js";
-    import { getAuth } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-    import { getFirestore } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
-
-    // Configuração fornecida pelo Firebase
-    const firebaseConfig = {
-      apiKey: "AIzaSyDuGe6qPKs2mMjf1IQNkEGzu0ybwGU0rxg",
-      authDomain: "recebimento-em-lote.firebaseapp.com",
-      projectId: "recebimento-em-lote",
-      storageBucket: "recebimento-em-lote.firebasestorage.app",
-      messagingSenderId: "1060968440971",
-      appId: "1:1060968440971:web:dbb5c264f8a85f86e6608e",
-      measurementId: "G-KZBGQVMG50"
-    };
-
-    // Inicializar o app
-    const app = initializeApp(firebaseConfig);
-
-    // Analytics (só funciona em HTTPS ou localhost)
-    try { getAnalytics(app); } catch (e) {}
-
-    // Instâncias básicas para usar depois
-    const auth = getAuth(app);
-    const db   = getFirestore(app);
-
-    // (Opcional) tornar acessível no console do navegador
-    window.firebase = { app, auth, db };
   </script>
 </body>
 </html>
